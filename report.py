@@ -387,8 +387,28 @@ def admin_hata_bildir(mesaj):
 # Ana akış
 # --------------------------------------------------------------------------- #
 
+# Rapor, teslim saatinden en fazla bu kadar önce üretilir (veri taze kalsın diye).
+GONDERIM_URETIM_BUTCESI = 240  # saniye (~4 dk)
+
+
+def _hedef_zaman_ist(hhmm):
+    """Bugün için Europe/Istanbul HH:MM zaman damgasını döndürür."""
+    saat, dakika = hhmm.split(":")
+    return datetime.now(IST).replace(hour=int(saat), minute=int(dakika),
+                                     second=0, microsecond=0)
+
+
+def _bekle_kadar(hedef_dt, aciklama):
+    """hedef_dt'ye kadar bekler; zaman geçmişse hiç beklemez."""
+    kalan = hedef_dt.timestamp() - datetime.now(IST).timestamp()
+    if kalan > 0:
+        print(f"[bilgi] {aciklama} ({int(kalan)} sn bekleniyor)...", file=sys.stderr)
+        time.sleep(kalan)
+
+
 def main():
     test_modu = "--test" in sys.argv
+    both_modu = "--both" in sys.argv    # Ayni raporu hem admin'e hem kanala gonder
 
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     kanal_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -398,38 +418,56 @@ def main():
         print("HATA: TELEGRAM_BOT_TOKEN tanımlı değil.", file=sys.stderr)
         sys.exit(1)
 
-    # Test modunda rapor kanala DEĞİL, admin'e gider
-    hedef_id = admin_id if test_modu else kanal_id
-    if not hedef_id:
-        eksik = "TELEGRAM_ADMIN_CHAT_ID" if test_modu else "TELEGRAM_CHAT_ID"
-        print(f"HATA: {eksik} tanımlı değil.", file=sys.stderr)
-        sys.exit(1)
+    if both_modu:
+        hedefler = [("admin", admin_id), ("kanal", kanal_id)]
+    elif test_modu:
+        hedefler = [("admin", admin_id)]
+    else:
+        hedefler = [("kanal", kanal_id)]
+
+    for ad, hid in hedefler:
+        if not hid:
+            degisken = "TELEGRAM_ADMIN_CHAT_ID" if ad == "admin" else "TELEGRAM_CHAT_ID"
+            print(f"HATA: {degisken} tanımlı değil.", file=sys.stderr)
+            sys.exit(1)
+
+    # SABİT TESLİM SAATİ: DELIVER_AT_TR (ör. "08:00") tanımlıysa rapor HER GÜN tam bu
+    # saatte gider. GitHub cron erken tetikler; biz tam saate kadar bekleriz. Böylece
+    # tetikleme kaysa bile teslim saati sabit kalır (alışkanlık için).
+    teslim = os.environ.get("DELIVER_AT_TR", "").strip()
+    zamanli = bool(teslim)
+    hedef_dt = _hedef_zaman_ist(teslim) if zamanli else None
 
     try:
-        # Adım 1
+        # Veri taze kalsın diye üretimi teslim saatinden hemen önce başlat
+        if zamanli:
+            uret_penceresi = datetime.fromtimestamp(
+                hedef_dt.timestamp() - GONDERIM_URETIM_BUTCESI, IST)
+            _bekle_kadar(uret_penceresi, "Üretim penceresine")
+
         print("[bilgi] Adım 1: Piyasa verileri çekiliyor...", file=sys.stderr)
         market_data = piyasa_verilerini_cek()
 
-        # Adım 2
         print("[bilgi] Adım 2: Rapor üretiliyor...", file=sys.stderr)
         rapor = rapor_uret(market_data)
 
         if test_modu:
-            # Testte rapor başına küçük bir işaret koy
-            rapor = "🧪 <b>[TEST]</b>\n\n" + rapor
+            rapor = "🧪 <b>[TEST]</b>" + chr(10) * 2 + rapor
 
-        # Adım 3
+        # Tam teslim saatine kadar bekle (dakikası dakikasına gönderim)
+        if zamanli:
+            _bekle_kadar(hedef_dt, f"Teslim saati {teslim} TSİ'ye")
+
         print("[bilgi] Adım 3: Telegram'a gönderiliyor...", file=sys.stderr)
-        adet = raporu_yolla(bot_token, hedef_id, rapor)
-
-        hedef_ad = "ADMIN (test)" if test_modu else "kanal"
-        print(f"[başarılı] Rapor {hedef_ad} hedefine {adet} mesaj olarak gönderildi.",
-              file=sys.stderr)
+        for ad, hid in hedefler:
+            adet = raporu_yolla(bot_token, hid, rapor)
+            print(f"[başarılı] Rapor '{ad}' hedefine {adet} mesaj olarak gönderildi.",
+                  file=sys.stderr)
 
     except Exception as e:                           # noqa: BLE001
         print(f"[HATA] {e}", file=sys.stderr)
         admin_hata_bildir(str(e))
-        sys.exit(1)                                  # Workflow'u failed düşür
+        sys.exit(1)
 
 
 if __name__ == "__main__":
