@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import html
+import json
 import re
 import shutil
 import subprocess
@@ -106,6 +107,8 @@ Sonra ayrı bir satıra ---DETAY--- koy. Sonra BÖLÜM 2'yi (DETAY, isteyen içi
 [her coin tek satır: sembol — fiyat ([24s %])]
 Dominans: BTC %.. · ETH %.. — Hacim: ..
 
+⏮️ <b>DÜNDEN</b> — Aşağıda "dünkü takip maddeleri" verildiyse, her birinin bugünkü SONUCUNU tek cümleyle yaz (isabet mi ıskaladık mı belli olsun). Madde verilmediyse bu bölümü TAMAMEN atla.
+
 📰 <b>GÜNDEM</b> — en önemli 3 gelişme. Her biri: [🔴 kritik / 🟡 önemli / 🟢 bilgi] <b>başlık</b> — 1-2 cümle + neden önemli — <a href="URL">kaynak</a>
 
 ⏰ <b>BUGÜN TAKİPTE</b>
@@ -125,7 +128,13 @@ KURALLAR:
 - Al/sat/tut önerisi ve fiyat hedefi verme.
 - Her gelişmede en az bir birincil/kurumsal kaynak linki; URL'lerdeki utm parametrelerini temizle.
 - Tekrar eden uyarı ekleme. DETAY bölümü toplam 1500-3500 karakter olsun.
-- Çıktı olarak SADECE raporu ver; "işte rapor" ya da "BÖLÜM 1/2" gibi ifade yazma. İlk satır doğrudan "📊 <b>GÜNAYDIN" ile başlasın."""
+- Çıktı olarak SADECE raporu ver; "işte rapor" ya da "BÖLÜM 1/2" gibi ifade yazma. İlk satır doğrudan "📊 <b>GÜNAYDIN" ile başlasın.
+
+RAPORUN EN SONUNA — Telegram'a GİTMEYECEK — bugün öne çıkan, YARIN sonucuna bakılacak 2-4 maddeyi tam bu formatta ekle:
+===TAKIP===
+["kısa madde 1", "kısa madde 2"]
+===TAKIP-SON===
+Geçerli JSON dizisi olsun; her madde kısa ve sonucu ölçülebilir olsun (ör. "ABD TÜFE verisi 15:30")."""
 
 
 # --------------------------------------------------------------------------- #
@@ -267,7 +276,7 @@ def tarih_basligi():
     return f"{now.day} {TR_AYLAR[now.month - 1]} {now.year}, {TR_GUNLER[now.weekday()]}"
 
 
-def rapor_uret(market_data):
+def rapor_uret(market_data, dun_takip_str=""):
     """
     Headless Claude Code'u (claude -p) çağırır. Anthropic API KEY kullanmaz;
     kimlik doğrulama CLAUDE_CODE_OAUTH_TOKEN ile abonelikten yapılır.
@@ -288,6 +297,10 @@ def rapor_uret(market_data):
               "kullanılacak (CI'da secret gereklidir).", file=sys.stderr)
 
     prompt = RAPOR_PROMPTU.format(market_data=market_data, tarih=tarih_basligi())
+    if dun_takip_str:
+        prompt += chr(10) * 2 + "DÜNKÜ TAKİP MADDELERİ (⏮️ DÜNDEN için sonuçlarını araştır): " + dun_takip_str
+    else:
+        prompt += chr(10) * 2 + "DÜNKÜ TAKİP MADDELERİ: yok (⏮️ DÜNDEN bölümünü atla)."
 
     # Çıktıyı düz metin olarak alıyoruz. --allowedTools ile sadece web araçlarına izin.
     komut = [
@@ -298,27 +311,35 @@ def rapor_uret(market_data):
     ]
 
     print("[bilgi] Claude Code raporu üretiyor (web araması yapılıyor)...", file=sys.stderr)
-    try:
-        sonuc = subprocess.run(
-            komut,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=CLAUDE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Claude Code {CLAUDE_TIMEOUT} saniyede yanıt vermedi.")
+    # Geçici claude hatalarına (rate/hiçkırık) karşı birkaç kez dene — 08:00 raporu
+    # tek bir aksaklıkta atlanmasın.
+    son_hata = None
+    for deneme in range(1, MAX_RETRY + 1):
+        try:
+            sonuc = subprocess.run(
+                komut, capture_output=True, text=True,
+                encoding="utf-8", timeout=CLAUDE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            son_hata = f"{CLAUDE_TIMEOUT} sn'de yanıt yok"
+            sonuc = None
 
-    if sonuc.returncode != 0:
-        raise RuntimeError(
-            f"Claude Code hata verdi (kod {sonuc.returncode}): {sonuc.stderr.strip()[:500]}"
-        )
+        if sonuc is not None:
+            if sonuc.returncode != 0:
+                son_hata = "kod %d: %s" % (
+                    sonuc.returncode,
+                    (sonuc.stderr.strip() or sonuc.stdout.strip() or "(çıktı boş)")[:600])
+            elif len((sonuc.stdout or "").strip()) < 200:
+                son_hata = "beklenenden kısa çıktı: %r" % (sonuc.stdout or "").strip()
+            else:
+                return sonuc.stdout.strip()
 
-    rapor = (sonuc.stdout or "").strip()
-    if len(rapor) < 200:
-        raise RuntimeError(f"Claude Code beklenenden kısa çıktı verdi: {rapor!r}")
+        print(f"[uyarı] Rapor üretimi başarısız ({deneme}/{MAX_RETRY}): {son_hata}",
+              file=sys.stderr)
+        if deneme < MAX_RETRY:
+            time.sleep(8 * deneme)
 
-    return rapor
+    raise RuntimeError(f"Claude Code {MAX_RETRY} denemede rapor üretemedi: {son_hata}")
 
 
 # --------------------------------------------------------------------------- #
@@ -468,6 +489,44 @@ def _bekle_kadar(hedef_dt, aciklama):
         time.sleep(kalan)
 
 
+STATE_YOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "takip.json")
+
+
+def dunku_takip_oku():
+    """state/takip.json varsa dünkü takip maddelerini (liste) döndürür; yoksa []."""
+    try:
+        with open(STATE_YOL, encoding="utf-8") as f:
+            t = json.load(f).get("takip", [])
+        return t if isinstance(t, list) else []
+    except (FileNotFoundError, ValueError, OSError):
+        return []
+
+
+def takip_ayikla(rapor):
+    """Rapordan ===TAKIP===...===TAKIP-SON=== bloğunu ayıklar (Telegram'a gitmez).
+    (temiz_rapor, liste) döndürür."""
+    import re as _re
+    m = _re.search(r"===TAKIP===\s*(.*?)\s*===TAKIP-SON===", rapor, _re.S)
+    takip = []
+    if m:
+        try:
+            v = json.loads(m.group(1).strip())
+            if isinstance(v, list):
+                takip = [str(x).strip() for x in v if str(x).strip()]
+        except ValueError:
+            takip = []
+    temiz = _re.split(r"===TAKIP===", rapor, maxsplit=1)[0].strip()
+    return temiz, takip
+
+
+def takip_yaz(takip):
+    """Bugünün takip listesini state/takip.json'a yazar (yarın 'DÜNDEN' için)."""
+    os.makedirs(os.path.dirname(STATE_YOL), exist_ok=True)
+    with open(STATE_YOL, "w", encoding="utf-8") as f:
+        json.dump({"tarih": datetime.now(IST).strftime("%Y-%m-%d"), "takip": takip},
+                  f, ensure_ascii=False, indent=2)
+
+
 def _brief_ayikla(rapor):
     """Brief'ten Hava (mood) ve Risk satırlarını ayıklar (kart için)."""
     duz = _html_temizle(rapor)
@@ -549,7 +608,9 @@ def main():
         market_data, veri = piyasa_verilerini_cek()
 
         print("[bilgi] Adım 2: Rapor üretiliyor...", file=sys.stderr)
-        rapor = rapor_uret(market_data)
+        dun_takip = dunku_takip_oku()
+        rapor = rapor_uret(market_data, "; ".join(dun_takip))
+        rapor, bugun_takip = takip_ayikla(rapor)
 
         if test_modu:
             rapor = "🧪 <b>[TEST]</b>" + chr(10) * 2 + rapor
@@ -575,6 +636,14 @@ def main():
         except Exception as kart_hata:               # noqa: BLE001
             print(f"[uyarı] Kart atlanıyor (rapor gönderildi): {kart_hata}",
                   file=sys.stderr)
+
+        # Bugünün takip listesini yarın için kaydet (test modunda kaydetme)
+        if not test_modu and bugun_takip:
+            try:
+                takip_yaz(bugun_takip)
+                print(f"[bilgi] {len(bugun_takip)} takip maddesi kaydedildi.", file=sys.stderr)
+            except Exception as se:                   # noqa: BLE001
+                print(f"[uyarı] Takip kaydedilemedi: {se}", file=sys.stderr)
 
     except Exception as e:                           # noqa: BLE001
         print(f"[HATA] {e}", file=sys.stderr)
